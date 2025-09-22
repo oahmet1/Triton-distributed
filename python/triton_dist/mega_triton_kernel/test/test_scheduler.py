@@ -574,7 +574,13 @@ def test_scheduler_executes_dependent_addition_graph(scheduler_device: torch.dev
     execution_order = _execute_sm_work_queues(sm_wq_list)
 
     assert execution_order[-1] is final_task
-    assert set(execution_order) == {first_task, second_task, final_task}
+    expected_task_keys = {
+        (task.layer_id, task.task_id, task.tile_id_or_start) for task in tasks
+    }
+    observed_task_keys = {
+        (task.layer_id, task.task_id, task.tile_id_or_start) for task in execution_order
+    }
+    assert observed_task_keys == expected_task_keys
     torch.testing.assert_close(partial_first, expected_first)
     torch.testing.assert_close(partial_second, expected_second)
     torch.testing.assert_close(final_output, expected_final)
