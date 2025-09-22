@@ -1,7 +1,7 @@
 import importlib
 import sys
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Tuple, Type
+from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Type
 
 import pytest
 
@@ -18,6 +18,9 @@ except ModuleNotFoundError:  # pragma: no cover
 import triton_dist.mega_triton_kernel.core.scheduler as _scheduler
 SchedulingStrategy = _scheduler.SchedulingStrategy
 enque_tasks = _scheduler.enque_tasks
+_round_robin_scheduler = _scheduler.round_robin_scheduler
+_zig_zag_scheduler = _scheduler.zig_zag_scheduler
+_task_dependency_opt = _scheduler.task_dependency_opt
 
 
 MAX_NUM_TENSOR_DIMS = 4
@@ -70,6 +73,7 @@ class DummyTask:
     dependency: List[DummyDependency]
     io_tensors: List[List[torch.Tensor]]
     extra_params: Dict[str, int]
+    compute: Optional[Callable[[], None]] = None
 
     @classmethod
     def get_task_type_id(cls) -> int:
@@ -137,6 +141,8 @@ def _make_dummy_task(
     tile_id_or_start: int,
     num_tiles: int,
     dependency: Iterable[DummyDependency] | None = None,
+    io_tensors: Optional[List[List[torch.Tensor]]] = None,
+    compute: Optional[Callable[[], None]] = None,
 ) -> DummyTask:
     return DummyTask(
         layer_id=layer_id,
@@ -145,8 +151,9 @@ def _make_dummy_task(
         num_tiles=num_tiles,
         config=DummyConfig(),
         dependency=list(dependency) if dependency is not None else [],
-        io_tensors=_make_dummy_io_tensors(device),
+        io_tensors=io_tensors if io_tensors is not None else _make_dummy_io_tensors(device),
         extra_params={},
+        compute=compute,
     )
 
 
@@ -233,24 +240,15 @@ def _schedule_tasks_for_strategy(
 ) -> List[List[DummyTask]]:
     """Reproduce the scheduler's task-to-SM assignment for expectation building."""
 
-    sm_wq_list: List[List[DummyTask]] = [[] for _ in range(num_sms)]
+    task_list = list(tasks)
     if strategy == SchedulingStrategy.ROUND_ROBIN:
-        for idx, task in enumerate(tasks):
-            sm_wq_list[idx % num_sms].append(task)
-        return sm_wq_list
+        sm_wq_list = _round_robin_scheduler(num_sms, task_list)
+    elif strategy == SchedulingStrategy.ZIG_ZAG:
+        sm_wq_list = _zig_zag_scheduler(num_sms, task_list)
+    else:
+        raise NotImplementedError(f"unsupported strategy {strategy!r}")
 
-    if strategy == SchedulingStrategy.ZIG_ZAG:
-        zigzag_iter = 1
-        for idx, task in enumerate(tasks):
-            if idx % num_sms == 0:
-                zigzag_iter ^= 1
-            if zigzag_iter == 0:
-                sm_wq_list[idx % num_sms].append(task)
-            else:
-                sm_wq_list[num_sms - 1 - (idx % num_sms)].append(task)
-        return sm_wq_list
-
-    raise NotImplementedError(f"unsupported strategy {strategy!r}")
+    return [list(queue) for queue in sm_wq_list]
 
 
 def _count_dependencies_after_opt(
@@ -278,6 +276,60 @@ def _count_dependencies_after_opt(
                 deps_range[key] = range_list + [(dep.start_tiles, dep.end_tiles)]
 
     return expected_count
+
+
+def _dependencies_satisfied(
+    task: DummyTask, completed_tiles: Set[Tuple[int, int, int]]
+) -> bool:
+    for dep in task.dependency:
+        for tile_idx in range(dep.start_tiles, dep.end_tiles):
+            if (dep.layer_id, dep.task_id, tile_idx) not in completed_tiles:
+                return False
+    return True
+
+
+def _execute_sm_work_queues(sm_wq_list: Iterable[Iterable[DummyTask]]) -> List[DummyTask]:
+    """Execute scheduled tasks while respecting dependency ranges."""
+
+    queues: List[List[DummyTask]] = [list(queue) for queue in sm_wq_list]
+    completed_tiles: Set[Tuple[int, int, int]] = set()
+    execution_order: List[DummyTask] = []
+
+    while any(queues):
+        progress = False
+        for queue in queues:
+            if not queue:
+                continue
+            task = queue[0]
+            if _dependencies_satisfied(task, completed_tiles):
+                queue.pop(0)
+                if task.compute is not None:
+                    task.compute()
+                for tile_idx in range(
+                    task.tile_id_or_start, task.tile_id_or_start + task.num_tiles
+                ):
+                    completed_tiles.add((task.layer_id, task.task_id, tile_idx))
+                execution_order.append(task)
+                progress = True
+
+        if not progress:
+            pending = [
+                (
+                    task.layer_id,
+                    task.task_id,
+                    [
+                        (dep.layer_id, dep.task_id, dep.start_tiles, dep.end_tiles)
+                        for dep in task.dependency
+                    ],
+                )
+                for queue in queues
+                for task in queue
+            ]
+            raise RuntimeError(
+                "No executable tasks remain; unresolved dependencies: " f"{pending!r}"
+            )
+
+    return execution_order
 
 
 @pytest.mark.parametrize(
@@ -428,3 +480,102 @@ def test_enque_tasks_zig_zag(scheduler_device: torch.device):
     assert int(wq_host[0, 1, 0].item()) == task_type_id
     assert int(wq_host[1, 1, 0].item()) == task_type_id
     assert int(wq_host[1, 0, 0].item()) == uint32_max
+
+
+def test_scheduler_executes_dependent_addition_graph(scheduler_device: torch.device):
+    """Execute dependent addition tasks and validate dependency enforcement."""
+
+    TaskTypeRegistry.reset_all_ids()
+    torch.manual_seed(0)
+
+    tensor_1 = torch.randn((4,), device=scheduler_device)
+    tensor_2 = torch.randn((4,), device=scheduler_device)
+    tensor_3 = torch.randn((4,), device=scheduler_device)
+    tensor_4 = torch.randn((4,), device=scheduler_device)
+
+    expected_first = tensor_1 + tensor_2
+    expected_second = tensor_3 + tensor_4
+    expected_final = expected_first + expected_second
+
+    partial_first = torch.empty_like(expected_first)
+    partial_second = torch.empty_like(expected_second)
+    final_output = torch.empty_like(expected_final)
+
+    executed_flags = {"first": False, "second": False}
+
+    def _first_addition() -> None:
+        executed_flags["first"] = True
+        partial_first.copy_(tensor_1 + tensor_2)
+
+    def _second_addition() -> None:
+        executed_flags["second"] = True
+        partial_second.copy_(tensor_3 + tensor_4)
+
+    def _final_addition() -> None:
+        assert executed_flags["first"], "final addition executed before first partial"
+        assert executed_flags["second"], "final addition executed before second partial"
+        torch.testing.assert_close(partial_first, expected_first)
+        torch.testing.assert_close(partial_second, expected_second)
+        final_output.copy_(partial_first + partial_second)
+
+    first_task = _make_dummy_task(
+        scheduler_device,
+        layer_id=0,
+        task_id=0,
+        tile_id_or_start=0,
+        num_tiles=1,
+        dependency=[],
+        io_tensors=[[tensor_1, tensor_2], [partial_first]],
+        compute=_first_addition,
+    )
+
+    second_task = _make_dummy_task(
+        scheduler_device,
+        layer_id=1,
+        task_id=0,
+        tile_id_or_start=0,
+        num_tiles=1,
+        dependency=[],
+        io_tensors=[[tensor_3, tensor_4], [partial_second]],
+        compute=_second_addition,
+    )
+
+    final_task = _make_dummy_task(
+        scheduler_device,
+        layer_id=2,
+        task_id=0,
+        tile_id_or_start=0,
+        num_tiles=1,
+        dependency=[
+            DummyDependency(layer_id=0, task_id=0, start_tiles=0, end_tiles=1),
+            DummyDependency(layer_id=1, task_id=0, start_tiles=0, end_tiles=1),
+        ],
+        io_tensors=[[partial_first, partial_second], [final_output]],
+        compute=_final_addition,
+    )
+
+    tasks = [first_task, second_task, final_task]
+    num_sms = 2
+    strategy = SchedulingStrategy.ROUND_ROBIN
+
+    wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
+        num_sms=num_sms,
+        megakernel_tasks=tasks,
+        strategy=strategy,
+        enable_dependency_opt=True,
+    )
+
+    assert num_tasks_tensor.cpu().tolist() == [2, 1]
+    assert task_deps_tensor.shape == (2, 2)
+    assert tuple(scoreboard.shape) == (3, 2, 1)
+
+    sm_wq_list = _schedule_tasks_for_strategy(tasks, num_sms=num_sms, strategy=strategy)
+    sm_wq_list = _task_dependency_opt(sm_wq_list)
+    execution_order = _execute_sm_work_queues(sm_wq_list)
+
+    assert execution_order[-1] is final_task
+    assert set(execution_order) == {first_task, second_task, final_task}
+    torch.testing.assert_close(partial_first, expected_first)
+    torch.testing.assert_close(partial_second, expected_second)
+    torch.testing.assert_close(final_output, expected_final)
+    assert final_output.device == scheduler_device
