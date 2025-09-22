@@ -1,4 +1,6 @@
+import importlib
 import importlib.util
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Type
@@ -220,6 +222,28 @@ def _build_dummy_tasks(device: torch.device):
     )
 
     return [first_task, second_task, third_task]
+
+
+def test_megakernel_import_skips_heavy_dependencies(monkeypatch):
+    module_name = "triton_dist.mega_triton_kernel"
+
+    for key in list(sys.modules.keys()):
+        if key == module_name or key.startswith(module_name + "."):
+            sys.modules.pop(key)
+
+    real_import_module = importlib.import_module
+
+    def guarded_import(name, package=None):
+        if name == module_name + ".tasks":
+            raise AssertionError("tasks module should not be imported during package import")
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", guarded_import)
+
+    module = importlib.import_module(module_name)
+
+    assert module.__name__ == module_name
+    assert "tasks" not in module.__dict__
 
 
 def test_enque_tasks_round_robin(scheduler_device: torch.device):
