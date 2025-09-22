@@ -1,8 +1,6 @@
 import importlib
-import importlib.util
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, Iterable, List, Tuple, Type
 
 import pytest
@@ -17,19 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
     torch_npu = None  # type: ignore[assignment]
 
 
-def _load_scheduler_module():
-    """Load the scheduler directly from its source file without package side-effects."""
-
-    module_name = "_triton_dist_scheduler"
-    scheduler_path = Path(__file__).resolve().parent.parent / "core" / "scheduler.py"
-    spec = importlib.util.spec_from_file_location(module_name, scheduler_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_scheduler = _load_scheduler_module()
+import triton_dist.mega_triton_kernel.core.scheduler as _scheduler
 SchedulingStrategy = _scheduler.SchedulingStrategy
 enque_tasks = _scheduler.enque_tasks
 
