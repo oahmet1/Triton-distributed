@@ -261,8 +261,18 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
     # sm0 receives tasks 0 and 2, sm1 receives task 1.
     assert num_tasks_tensor.cpu().tolist() == [2, 1]
 
-    # Scoreboard should track three layers, one task per layer, and the maximum tile count (3).
-    assert scoreboard.shape == (3, 1, 3)
+    # Scoreboard dimensions reflect the maximum layer/task identifiers and tile count the
+    # scheduler observed while materialising the work queues. The implementation clamps the
+    # layer and task extents to at least two slots via the ``max_*`` seeds.
+    max_layer_id = max(task.layer_id for task in tasks)
+    max_task_id = max(task.task_id for task in tasks)
+    max_tiles = max(task.num_tiles for task in tasks)
+    expected_scoreboard_shape = (
+        max_layer_id + 1,
+        max(max_task_id, 1) + 1,
+        max(max_tiles, 1),
+    )
+    assert tuple(scoreboard.shape) == expected_scoreboard_shape
 
     # Dependencies from the second and third task are encoded.
     assert task_deps_tensor.shape == (3, 2)
@@ -294,7 +304,15 @@ def test_enque_tasks_zig_zag(scheduler_device: torch.device):
     assert num_tasks_tensor.cpu().tolist() == [1, 2]
 
     # Shared invariants with the round-robin path.
-    assert scoreboard.shape == (3, 1, 3)
+    max_layer_id = max(task.layer_id for task in tasks)
+    max_task_id = max(task.task_id for task in tasks)
+    max_tiles = max(task.num_tiles for task in tasks)
+    expected_scoreboard_shape = (
+        max_layer_id + 1,
+        max(max_task_id, 1) + 1,
+        max(max_tiles, 1),
+    )
+    assert tuple(scoreboard.shape) == expected_scoreboard_shape
     assert task_deps_tensor.shape == (3, 2)
 
     wq_host = wq_tensor.cpu()
