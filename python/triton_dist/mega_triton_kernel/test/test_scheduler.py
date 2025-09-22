@@ -1,5 +1,9 @@
-import pytest
+import importlib.util
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple, Type
+
+import pytest
 
 torch = pytest.importorskip("torch")
 
@@ -10,24 +14,123 @@ try:  # pragma: no cover - the import is best-effort for Ascend environments.
 except ModuleNotFoundError:  # pragma: no cover
     torch_npu = None  # type: ignore[assignment]
 
-from triton_dist.mega_triton_kernel.core.config import ConfigBase
-from triton_dist.mega_triton_kernel.core.scheduler import SchedulingStrategy, enque_tasks
-from triton_dist.mega_triton_kernel.core.task_base import (
-    TaskBase,
-    TaskDependency,
-    TaskIDManager,
-)
+
+def _load_scheduler_module():
+    """Load the scheduler directly from its source file without package side-effects."""
+
+    module_name = "_triton_dist_scheduler"
+    scheduler_path = Path(__file__).resolve().parent.parent / "core" / "scheduler.py"
+    spec = importlib.util.spec_from_file_location(module_name, scheduler_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_scheduler = _load_scheduler_module()
+SchedulingStrategy = _scheduler.SchedulingStrategy
+enque_tasks = _scheduler.enque_tasks
+
+
+MAX_NUM_TENSOR_DIMS = 4
+
+
+class TaskTypeRegistry:
+    """Simple stand-in for the production ``TaskIDManager``."""
+
+    _type_id_counter: int = 0
+    _type_id_map: Dict[Type[object], int] = {}
+
+    @classmethod
+    def get_task_type_id(cls, task_cls: Type[object]) -> int:
+        if task_cls not in cls._type_id_map:
+            cls._type_id_map[task_cls] = cls._type_id_counter
+            cls._type_id_counter += 1
+        return cls._type_id_map[task_cls]
+
+    @classmethod
+    def reset_all_ids(cls) -> None:
+        cls._type_id_counter = 0
+        cls._type_id_map.clear()
 
 
 @dataclass
-class DummyConfig(ConfigBase):
+class DummyConfig:
     """Trivial configuration for dummy tasks."""
 
 
 @dataclass
-class DummyTask(TaskBase):
-    """Minimal ``TaskBase`` implementation for exercising the scheduler."""
+class DummyDependency:
+    layer_id: int
+    task_id: int
+    start_tiles: int
+    end_tiles: int
+
+    def key(self) -> Tuple[int, int]:
+        return (self.layer_id, self.task_id)
+
+
+@dataclass
+class DummyTask:
+    """Minimal task implementation for exercising the scheduler."""
+
+    layer_id: int
+    task_id: int
+    tile_id_or_start: int
+    num_tiles: int
     config: DummyConfig
+    dependency: List[DummyDependency]
+    io_tensors: List[List[torch.Tensor]]
+    extra_params: Dict[str, int]
+
+    @classmethod
+    def get_task_type_id(cls) -> int:
+        return TaskTypeRegistry.get_task_type_id(cls)
+
+    def _io_to_tuple(self) -> Tuple[int, ...]:
+        tensors: Iterable[torch.Tensor] = self.io_tensors[0] + self.io_tensors[1]
+        entries: List[int] = []
+        for tensor in tensors:
+            data_ptr = tensor.data_ptr()
+            ptr_low = data_ptr & 0xFFFFFFFF
+            ptr_high = (data_ptr >> 32) & 0xFFFFFFFF
+
+            shape = list(tensor.shape)
+            if len(shape) > MAX_NUM_TENSOR_DIMS:
+                raise ValueError("unexpected tensor rank in dummy task")
+            padded_shape = shape + [1] * (MAX_NUM_TENSOR_DIMS - len(shape))
+
+            tensor_fields = [ptr_low, ptr_high, *padded_shape]
+            if len(tensor_fields) % 2 != 0:
+                raise AssertionError("tensor metadata must maintain 64-bit alignment")
+            entries.extend(tensor_fields)
+
+        return tuple(entries)
+
+    def _extra_params_to_tuple(self) -> Tuple[int, ...]:
+        assert not self.extra_params, "dummy tasks do not support extra params"
+        return ()
+
+    def encoding_with_deps(self, deps_l: int, deps_r: int) -> Tuple[int, ...]:
+        entries: List[int] = [
+            self.get_task_type_id(),
+            self.layer_id,
+            self.task_id,
+            self.tile_id_or_start,
+            deps_l,
+            deps_r,
+        ]
+
+        io_tuple = self._io_to_tuple()
+        if len(entries) % 2 != 0:
+            raise AssertionError("task header must maintain 64-bit alignment")
+        entries.extend(io_tuple)
+        entries.extend(self._extra_params_to_tuple())
+
+        for value in entries:
+            if not isinstance(value, int):
+                raise TypeError(f"expected int in encoding, got {type(value)!r}")
+        return tuple(entries)
 
 
 def _npu_available() -> bool:
@@ -97,7 +200,7 @@ def _build_dummy_tasks(device: torch.device):
         tile_id_or_start=0,
         num_tiles=3,
         config=DummyConfig(),
-        dependency=[TaskDependency(layer_id=0, task_id=0, start_tiles=0, end_tiles=2)],
+        dependency=[DummyDependency(layer_id=0, task_id=0, start_tiles=0, end_tiles=2)],
         io_tensors=_make_io_tensors(),
         extra_params={},
     )
@@ -109,8 +212,8 @@ def _build_dummy_tasks(device: torch.device):
         num_tiles=1,
         config=DummyConfig(),
         dependency=[
-            TaskDependency(layer_id=1, task_id=0, start_tiles=1, end_tiles=3),
-            TaskDependency(layer_id=0, task_id=0, start_tiles=1, end_tiles=2),
+            DummyDependency(layer_id=1, task_id=0, start_tiles=1, end_tiles=3),
+            DummyDependency(layer_id=0, task_id=0, start_tiles=1, end_tiles=2),
         ],
         io_tensors=_make_io_tensors(),
         extra_params={},
@@ -122,7 +225,7 @@ def _build_dummy_tasks(device: torch.device):
 def test_enque_tasks_round_robin(scheduler_device: torch.device):
     """Ensure round-robin scheduling can enqueue dummy tasks."""
 
-    TaskIDManager.reset_all_ids()
+    TaskTypeRegistry.reset_all_ids()
     tasks = _build_dummy_tasks(scheduler_device)
     wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
         num_sms=2,
@@ -154,7 +257,7 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
 def test_enque_tasks_zig_zag(scheduler_device: torch.device):
     """Ensure zig-zag scheduling can enqueue dummy tasks."""
 
-    TaskIDManager.reset_all_ids()
+    TaskTypeRegistry.reset_all_ids()
     tasks = _build_dummy_tasks(scheduler_device)
     wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
         num_sms=2,
