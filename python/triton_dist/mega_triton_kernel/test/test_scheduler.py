@@ -224,6 +224,60 @@ def _build_dummy_tasks(device: torch.device):
     return [first_task, second_task, third_task]
 
 
+def _schedule_tasks_for_strategy(
+    tasks: Iterable[DummyTask],
+    num_sms: int,
+    strategy: SchedulingStrategy,
+) -> List[List[DummyTask]]:
+    """Reproduce the scheduler's task-to-SM assignment for expectation building."""
+
+    sm_wq_list: List[List[DummyTask]] = [[] for _ in range(num_sms)]
+    if strategy == SchedulingStrategy.ROUND_ROBIN:
+        for idx, task in enumerate(tasks):
+            sm_wq_list[idx % num_sms].append(task)
+        return sm_wq_list
+
+    if strategy == SchedulingStrategy.ZIG_ZAG:
+        zigzag_iter = 1
+        for idx, task in enumerate(tasks):
+            if idx % num_sms == 0:
+                zigzag_iter ^= 1
+            if zigzag_iter == 0:
+                sm_wq_list[idx % num_sms].append(task)
+            else:
+                sm_wq_list[num_sms - 1 - (idx % num_sms)].append(task)
+        return sm_wq_list
+
+    raise NotImplementedError(f"unsupported strategy {strategy!r}")
+
+
+def _count_dependencies_after_opt(
+    tasks: Iterable[DummyTask],
+    num_sms: int,
+    strategy: SchedulingStrategy,
+) -> int:
+    """Return the expected dependency tensor rows after applying the optimiser."""
+
+    scheduled_tasks = _schedule_tasks_for_strategy(tasks, num_sms=num_sms, strategy=strategy)
+
+    expected_count = 0
+    for queue in scheduled_tasks:
+        deps_range: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+        for task in queue:
+            for dep in task.dependency:
+                key = dep.key()
+                range_list = deps_range.get(key, [])
+                covered = any(
+                    left <= dep.start_tiles and right >= dep.end_tiles
+                    for left, right in range_list
+                )
+                if not covered:
+                    expected_count += 1
+                deps_range[key] = range_list + [(dep.start_tiles, dep.end_tiles)]
+
+    return expected_count
+
+
 def test_megakernel_import_skips_heavy_dependencies(monkeypatch):
     module_name = "triton_dist.mega_triton_kernel"
 
@@ -251,6 +305,12 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
 
     TaskTypeRegistry.reset_all_ids()
     tasks = _build_dummy_tasks(scheduler_device)
+    expected_task_deps = _count_dependencies_after_opt(
+        tasks, num_sms=2, strategy=SchedulingStrategy.ROUND_ROBIN
+    )
+    max_layer_id = max(task.layer_id for task in tasks)
+    max_task_id = max(task.task_id for task in tasks)
+    max_tiles = max(task.num_tiles for task in tasks)
     wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
         num_sms=2,
         megakernel_tasks=tasks,
@@ -264,9 +324,6 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
     # Scoreboard dimensions reflect the maximum layer/task identifiers and tile count the
     # scheduler observed while materialising the work queues. The implementation clamps the
     # layer and task extents to at least two slots via the ``max_*`` seeds.
-    max_layer_id = max(task.layer_id for task in tasks)
-    max_task_id = max(task.task_id for task in tasks)
-    max_tiles = max(task.num_tiles for task in tasks)
     expected_scoreboard_shape = (
         max_layer_id + 1,
         max(max_task_id, 1) + 1,
@@ -275,7 +332,7 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
     assert tuple(scoreboard.shape) == expected_scoreboard_shape
 
     # Dependencies from the second and third task are encoded.
-    assert task_deps_tensor.shape == (3, 2)
+    assert task_deps_tensor.shape == (expected_task_deps, 2)
 
     # Verify that valid task entries share the same dummy type id and padding is set to uint32 max.
     wq_host = wq_tensor.cpu()
@@ -293,6 +350,12 @@ def test_enque_tasks_zig_zag(scheduler_device: torch.device):
 
     TaskTypeRegistry.reset_all_ids()
     tasks = _build_dummy_tasks(scheduler_device)
+    expected_task_deps = _count_dependencies_after_opt(
+        tasks, num_sms=2, strategy=SchedulingStrategy.ZIG_ZAG
+    )
+    max_layer_id = max(task.layer_id for task in tasks)
+    max_task_id = max(task.task_id for task in tasks)
+    max_tiles = max(task.num_tiles for task in tasks)
     wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
         num_sms=2,
         megakernel_tasks=tasks,
@@ -304,16 +367,13 @@ def test_enque_tasks_zig_zag(scheduler_device: torch.device):
     assert num_tasks_tensor.cpu().tolist() == [1, 2]
 
     # Shared invariants with the round-robin path.
-    max_layer_id = max(task.layer_id for task in tasks)
-    max_task_id = max(task.task_id for task in tasks)
-    max_tiles = max(task.num_tiles for task in tasks)
     expected_scoreboard_shape = (
         max_layer_id + 1,
         max(max_task_id, 1) + 1,
         max(max_tiles, 1),
     )
     assert tuple(scoreboard.shape) == expected_scoreboard_shape
-    assert task_deps_tensor.shape == (3, 2)
+    assert task_deps_tensor.shape == (expected_task_deps, 2)
 
     wq_host = wq_tensor.cpu()
     task_type_id = DummyTask.get_task_type_id()
