@@ -135,6 +135,35 @@ class DummyTask:
         return tuple(entries)
 
 
+def _make_dummy_io_tensors(device: torch.device) -> List[List[torch.Tensor]]:
+    """Allocate unique tensors for dummy task encoding."""
+
+    input_tensor = torch.empty((4,), device=device, dtype=torch.float32)
+    output_tensor = torch.empty((4,), device=device, dtype=torch.float32)
+    return [[input_tensor], [output_tensor]]
+
+
+def _make_dummy_task(
+    device: torch.device,
+    *,
+    layer_id: int,
+    task_id: int,
+    tile_id_or_start: int,
+    num_tiles: int,
+    dependency: Iterable[DummyDependency] | None = None,
+) -> DummyTask:
+    return DummyTask(
+        layer_id=layer_id,
+        task_id=task_id,
+        tile_id_or_start=tile_id_or_start,
+        num_tiles=num_tiles,
+        config=DummyConfig(),
+        dependency=list(dependency) if dependency is not None else [],
+        io_tensors=_make_dummy_io_tensors(device),
+        extra_params={},
+    )
+
+
 def _npu_available() -> bool:
     """Return ``True`` when PyTorch exposes a functional NPU backend."""
 
@@ -179,46 +208,33 @@ def scheduler_device(monkeypatch) -> torch.device:
 def _build_dummy_tasks(device: torch.device):
     """Construct a small set of tasks with simple data dependencies."""
 
-    def _make_io_tensors():
-        # Create unique tensors to ensure distinct data pointers for encoding.
-        input_tensor = torch.empty((4,), device=device, dtype=torch.float32)
-        output_tensor = torch.empty((4,), device=device, dtype=torch.float32)
-        return [[input_tensor], [output_tensor]]
-
-    first_task = DummyTask(
+    first_task = _make_dummy_task(
+        device,
         layer_id=0,
         task_id=0,
         tile_id_or_start=0,
         num_tiles=2,
-        config=DummyConfig(),
-        dependency=[],
-        io_tensors=_make_io_tensors(),
-        extra_params={},
     )
 
-    second_task = DummyTask(
+    second_task = _make_dummy_task(
+        device,
         layer_id=1,
         task_id=0,
         tile_id_or_start=0,
         num_tiles=3,
-        config=DummyConfig(),
         dependency=[DummyDependency(layer_id=0, task_id=0, start_tiles=0, end_tiles=2)],
-        io_tensors=_make_io_tensors(),
-        extra_params={},
     )
 
-    third_task = DummyTask(
+    third_task = _make_dummy_task(
+        device,
         layer_id=2,
         task_id=0,
         tile_id_or_start=1,
         num_tiles=1,
-        config=DummyConfig(),
         dependency=[
             DummyDependency(layer_id=1, task_id=0, start_tiles=1, end_tiles=3),
             DummyDependency(layer_id=0, task_id=0, start_tiles=1, end_tiles=2),
         ],
-        io_tensors=_make_io_tensors(),
-        extra_params={},
     )
 
     return [first_task, second_task, third_task]
@@ -278,6 +294,49 @@ def _count_dependencies_after_opt(
     return expected_count
 
 
+@pytest.mark.parametrize(
+    ("task_specs", "expected_shape"),
+    [
+        pytest.param([(0, 0, 0, 1)], (2, 2, 1), id="single_task_minimum"),
+        pytest.param([(3, 4, 0, 5)], (4, 5, 5), id="high_identifiers"),
+        pytest.param(
+            [(1, 0, 0, 2), (5, 7, 0, 1)],
+            (6, 8, 2),
+            id="multiple_tasks",
+        ),
+    ],
+)
+def test_work_queue_scoreboard_dimensions(
+    scheduler_device: torch.device, task_specs: List[Tuple[int, int, int, int]], expected_shape
+):
+    """Scoreboard dimensions grow with the maximum observed layer/task IDs and tile counts."""
+
+    TaskTypeRegistry.reset_all_ids()
+    tasks = [
+        _make_dummy_task(
+            scheduler_device,
+            layer_id=layer_id,
+            task_id=task_id,
+            tile_id_or_start=tile_start,
+            num_tiles=num_tiles,
+        )
+        for (layer_id, task_id, tile_start, num_tiles) in task_specs
+    ]
+
+    wq_tensor, num_tasks_tensor, scoreboard, task_deps_tensor = enque_tasks(
+        num_sms=1,
+        megakernel_tasks=tasks,
+        strategy=SchedulingStrategy.ROUND_ROBIN,
+        enable_dependency_opt=True,
+    )
+
+    assert tuple(scoreboard.shape) == expected_shape
+    assert num_tasks_tensor.cpu().tolist() == [len(task_specs)]
+    assert task_deps_tensor.shape == (0, 2)
+    assert wq_tensor.shape[0] == len(task_specs)
+    assert wq_tensor.shape[1] == 1
+
+
 def test_megakernel_import_skips_heavy_dependencies(monkeypatch):
     module_name = "triton_dist.mega_triton_kernel"
 
@@ -325,7 +384,7 @@ def test_enque_tasks_round_robin(scheduler_device: torch.device):
     # scheduler observed while materialising the work queues. The implementation clamps the
     # layer and task extents to at least two slots via the ``max_*`` seeds.
     expected_scoreboard_shape = (
-        max_layer_id + 1,
+        max(max_layer_id, 1) + 1,
         max(max_task_id, 1) + 1,
         max(max_tiles, 1),
     )
@@ -368,7 +427,7 @@ def test_enque_tasks_zig_zag(scheduler_device: torch.device):
 
     # Shared invariants with the round-robin path.
     expected_scoreboard_shape = (
-        max_layer_id + 1,
+        max(max_layer_id, 1) + 1,
         max(max_task_id, 1) + 1,
         max(max_tiles, 1),
     )
